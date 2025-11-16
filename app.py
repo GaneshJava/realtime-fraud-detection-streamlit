@@ -1,5 +1,20 @@
-# app.py (updated)
+# app.py
+"""
+Real-Time Fraud Detection Prototype (ML + Rules)
+- Dynamic channel-specific UI (Bank, Mobile App, ATM, Credit Card, POS, Online Purchase, NetBanking)
+- ML scoring using pre-saved supervised_pipeline & iforest_pipeline (joblib)
+- Extended Rule Engine:
+    * Velocity rules (1h, 24h, 7d)
+    * Behavioural anomalies (device churn, new device + new location + high amount)
+    * IP / geo mismatch, impossible travel (Haversine)
+    * Spending spike vs monthly average & rolling average
+    * Channel-specific rules (card, ATM, online shipping mismatch, new beneficiary)
+- Rules produce structured outputs (name, severity, detail)
+- Final risk = combination of ML risk and highest rule severity with clear logic
+"""
+
 import datetime
+from math import radians, sin, cos, asin, sqrt
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -8,33 +23,55 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ------------------------------
-# 1. Load artifacts (cached)
-# ------------------------------
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Return distance in km between two lat/lon points."""
+    # If any missing, return None
+    if None in (lat1, lon1, lat2, lon2):
+        return None
+    # convert decimal degrees to radians
+    lat1, lon1, lat2, lon2 = map(radians, (lat1, lon1, lat2, lon2))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    c = 2 * asin(sqrt(a))
+    km = 6371 * c
+    return km
+
+# Map severity order
+SEVERITY_ORDER = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+def escalate(a: str, b: str) -> str:
+    """Return the higher severity between a and b."""
+    return a if SEVERITY_ORDER[a] >= SEVERITY_ORDER[b] else b
+
+# ----------------------------
+# Load ML artifacts (cached)
+# ----------------------------
 @st.cache_resource
 def load_artifacts():
     models_dir = Path("models")
-
     def _load(name: str):
         path = models_dir / name
         try:
             return joblib.load(path)
         except Exception as e:
-            st.error(f"❌ Error loading {name}")
+            # bubble up with clear messaging
+            st.error(f"Error loading model artifact: {name}")
             st.exception(e)
             raise
-
     supervised_pipeline = _load("supervised_lgbm_pipeline.joblib")
     iforest_pipeline = _load("iforest_pipeline.joblib")
-
     return supervised_pipeline, iforest_pipeline
-
 
 supervised_pipeline, iforest_pipeline = load_artifacts()
 
-# ------------------------------
-# 2. Risk thresholds & mapping
-# ------------------------------
+# ----------------------------
+# ML risk thresholds
+# ----------------------------
 FRAUD_MED = 0.00005
 FRAUD_HIGH = 0.00023328
 FRAUD_CRIT = 0.01732857
@@ -43,457 +80,440 @@ ANOM_MED = 0.04
 ANOM_HIGH = 0.05
 ANOM_CRIT = 0.08
 
-
-def risk_from_scores(fraud_prob: float, anomaly_score: float) -> str:
+def ml_risk_label(fraud_prob: float, anomaly_score: float) -> str:
     if fraud_prob >= FRAUD_CRIT or anomaly_score >= ANOM_CRIT:
         return "CRITICAL"
-    elif fraud_prob >= FRAUD_HIGH or (
-        fraud_prob >= FRAUD_MED and anomaly_score >= ANOM_HIGH
-    ):
+    elif fraud_prob >= FRAUD_HIGH or (fraud_prob >= FRAUD_MED and anomaly_score >= ANOM_HIGH):
         return "HIGH"
     elif fraud_prob >= FRAUD_MED or anomaly_score >= ANOM_MED:
         return "MEDIUM"
     else:
         return "LOW"
 
-
-# ------------------------------
-# 3. Rule engine
-# ------------------------------
-def evaluate_rules(
-    payload: Dict,
-    fraud_prob: float,
-    anomaly_score: float,
-) -> Tuple[List[Dict], str]:
+# ----------------------------
+# Rule engine
+# ----------------------------
+def evaluate_rules(payload: Dict) -> Tuple[List[Dict], str]:
     """
-    Returns (triggered_rules, rules_overall_level)
-    Each rule is a dict: {"name": str, "severity": "LOW|MEDIUM|HIGH|CRITICAL", "detail": str}
-    The overall rules_overall_level is the highest severity among rules.
+    Evaluate deterministic rules on the payload.
+    Returns: (list_of_triggered_rules, highest_severity)
+    Each rule: {"name": str, "severity": "LOW|MEDIUM|HIGH|CRITICAL", "detail": str}
     """
-
     rules: List[Dict] = []
-    # helper
-    def add(name, severity, detail):
-        rules.append({"name": name, "severity": severity, "detail": detail})
 
-    amount = float(payload.get("Amount", 0.0))
-    channel = payload.get("Channel", "").lower()
-    location = payload.get("Location", "").strip().lower()
+    # convenience getters
+    amt = float(payload.get("Amount", 0.0) or 0.0)
+    channel = str(payload.get("Channel", "")).lower()
     hour = int(payload.get("hour", 0))
-    device = payload.get("DeviceID", "")
-    ip_country = payload.get("ip_country", None)
-    declared_country = payload.get("declared_country", None)
     monthly_avg = float(payload.get("monthly_avg", 0.0) or 0.0)
-    txns_24h = int(payload.get("transactions_last_24h", 0) or 0)
+    rolling_avg_7d = float(payload.get("rolling_avg_7d", 0.0) or 0.0)
+    txns_1h = int(payload.get("txns_last_1h", 0) or 0)
+    txns_24h = int(payload.get("txns_last_24h", 0) or 0)
+    txns_7d = int(payload.get("txns_last_7d", 0) or 0)
     failed_logins = int(payload.get("failed_login_attempts", 0) or 0)
-    new_beneficiary = bool(payload.get("new_beneficiary", False))
+    new_benef = bool(payload.get("new_beneficiary", False))
+    ip_country = str(payload.get("ip_country", "")).lower()
+    declared_country = str(payload.get("declared_country", "")).lower()
+    last_device = str(payload.get("device_last_seen", "")).lower()
+    curr_device = str(payload.get("DeviceID", "")).lower()
+    last_lat = payload.get("last_known_lat")
+    last_lon = payload.get("last_known_lon")
+    txn_lat = payload.get("txn_lat")
+    txn_lon = payload.get("txn_lon")
     atm_distance_km = float(payload.get("atm_distance_km", 0.0) or 0.0)
+    card_country = str(payload.get("card_country", "")).lower()
     cvv_provided = payload.get("cvv_provided", True)
-    card_country = payload.get("card_country", None)
-    device_last_seen = payload.get("device_last_seen", None)
-    txn_country = declared_country or location
+    card_masked = payload.get("card_masked", "")
+    shipping_addr = payload.get("shipping_address", "")
+    billing_addr = payload.get("billing_address", "")
+    beneficiaries_added_24h = int(payload.get("beneficiaries_added_24h", 0) or 0)
+    suspicious_ip_flag = payload.get("suspicious_ip_flag", False)
 
-    # CRITICAL rules
-    # 1) CVV missing on online card payment (common high-risk indicator)
-    if channel == "card" or channel == "online":
-        if (channel == "online" or payload.get("card_used_online", False)) and not cvv_provided:
-            add(
-                "Missing CVV for online card transaction",
-                "HIGH",
-                "Card transaction attempted online without CVV verification.",
-            )
+    # helper to add rule
+    def add_rule(name: str, sev: str, detail: str):
+        rules.append({"name": name, "severity": sev, "detail": detail})
 
-    # 2) Very large single transaction vs limits
-    ABSOLUTE_HIGH_AMOUNT = 10_000_000  # example absolute threshold (tune for your currency)
-    if amount >= ABSOLUTE_HIGH_AMOUNT:
-        add(
-            "Very large amount",
-            "CRITICAL",
-            f"Transaction amount {amount} exceeds absolute high threshold {ABSOLUTE_HIGH_AMOUNT}.",
-        )
+    # -------- CRITICAL rules --------
+    # huge absolute amount (tunable per product/currency)
+    ABSOLUTE_CRIT_AMOUNT = 10_000_000  # tune
+    if amt >= ABSOLUTE_CRIT_AMOUNT:
+        add_rule("Absolute very large amount", "CRITICAL",
+                 f"Amount {amt} >= critical threshold {ABSOLUTE_CRIT_AMOUNT}.")
 
-    # 3) ATM distance large (card used far from last known location)
-    if channel == "atm" and atm_distance_km and atm_distance_km > 500:
-        add(
-            "ATM distant from last known location",
-            "HIGH",
-            f"ATM distance {atm_distance_km:.1f} km from customer's last known region.",
-        )
+    # new device + new high-amount + new location (behavioural anomaly)
+    impossible_travel_distance = None
+    if last_lat is not None and last_lon is not None and txn_lat is not None and txn_lon is not None:
+        impossible_travel_distance = haversine_km(last_lat, last_lon, txn_lat, txn_lon)
+    device_new = (not last_device) or (last_device == "")
+    location_changed = False
+    if impossible_travel_distance is not None and impossible_travel_distance > 500:
+        # e.g., >500km since last known location in short time is suspicious
+        location_changed = True
 
-    # HIGH / MEDIUM rules
-    # 4) Amount much higher than customer's monthly average (sudden spike)
-    if monthly_avg > 0:
-        if amount >= 5 * monthly_avg and amount > 2000:
-            add(
-                "Spike vs monthly average",
-                "HIGH",
-                f"Transaction amount {amount} is >=5x customer's monthly average {monthly_avg:.2f}.",
-            )
-        elif amount >= 2 * monthly_avg and amount > 1000:
-            add(
-                "Above usual spend",
-                "MEDIUM",
-                f"Transaction amount {amount} is >=2x customer's monthly average {monthly_avg:.2f}.",
-            )
+    if device_new and location_changed and amt > 1000:
+        add_rule("New device + Impossible travel + High amount", "CRITICAL",
+                 f"Device unseen before and travel {impossible_travel_distance:.1f} km since last known location; amount {amt}.")
 
-    # 5) Velocity: many transactions in last 24 hours
-    if txns_24h >= 20:
-        add(
-            "High velocity (24h)",
-            "HIGH",
-            f"{txns_24h} transactions in the last 24 hours.",
-        )
-    elif txns_24h >= 6:
-        add(
-            "Suspicious velocity (24h)",
-            "MEDIUM",
-            f"{txns_24h} transactions in the last 24 hours.",
-        )
+    # multiple beneficiaries added recently + fund out
+    if beneficiaries_added_24h >= 3 and amt > 2000:
+        add_rule("Multiple beneficiaries added recently + high transfer", "CRITICAL",
+                 f"{beneficiaries_added_24h} beneficiaries added in last 24h and transfer amount {amt}.")
 
-    # 6) IP country vs declared country mismatch
-    if ip_country and txn_country and ip_country.lower() != str(txn_country).lower():
-        # Some mismatches are benign; use heuristics
-        suspicious_countries = {"nigeria", "romania", "ukraine", "russia"}  # example
-        severity = "HIGH" if ip_country.lower() in suspicious_countries or amount > 2000 else "MEDIUM"
-        add(
-            "IP country mismatch",
-            severity,
-            f"IP country={ip_country} differs from declared/txn country={txn_country}.",
-        )
+    # -------- HIGH rules --------
+    # Velocity: many transactions in short window
+    if txns_1h >= 10:
+        add_rule("High velocity (1h)", "HIGH", f"{txns_1h} transactions in the last 1 hour.")
+    if txns_24h >= 50:
+        add_rule("Very high velocity (24h)", "HIGH", f"{txns_24h} transactions in the last 24 hours.")
 
-    # 7) Device has not been seen before and a high-value transaction
-    if device_last_seen is None or device_last_seen == "":
-        if amount > 1000:
-            add(
-                "New device + high amount",
-                "HIGH",
-                "Transaction originates from a device not seen before and amount is high.",
-            )
-        else:
-            add(
-                "New device (low amount)",
-                "MEDIUM",
-                "Transaction originates from a device not seen before.",
-            )
-    else:
-        if device and device_last_seen and device.lower() != device_last_seen.lower():
-            add(
-                "Device mismatch",
-                "MEDIUM",
-                f"Current device '{device}' differs from last seen '{device_last_seen}'.",
-            )
+    # IP country mismatch especially for high amount
+    if ip_country and declared_country and ip_country != declared_country:
+        sev = "HIGH" if amt > 2000 else "MEDIUM"
+        add_rule("IP / Declared country mismatch", sev,
+                 f"IP country '{ip_country}' differs from declared country '{declared_country}'.")
 
-    # 8) Multiple failed logins recently
+    # multiple failed logins
     if failed_logins >= 5:
-        add(
-            "Many failed login attempts",
-            "HIGH",
-            f"{failed_logins} failed authentication attempts recently.",
-        )
-    elif failed_logins >= 3:
-        add(
-            "Failed login attempts",
-            "MEDIUM",
-            f"{failed_logins} failed authentication attempts recently.",
-        )
+        add_rule("Multiple failed login attempts", "HIGH", f"{failed_logins} failed auth attempts.")
 
-    # 9) New beneficiary + high amount
-    if new_beneficiary and amount > 1000:
-        add(
-            "New beneficiary + high transfer",
-            "HIGH",
-            "Funds are being sent to a newly added beneficiary with a high amount.",
-        )
+    # new beneficiary + large transfer
+    if new_benef and amt >= 1000:
+        add_rule("New beneficiary + significant amount", "HIGH",
+                 "Transfer to newly added beneficiary with amount above threshold.")
 
-    # 10) Time-of-day oddity (late-night transaction for user with low activity)
-    if hour >= 0 and hour <= 5 and monthly_avg < 2000 and amount > 100:
-        add(
-            "Odd hour transaction",
-            "MEDIUM",
-            f"Transaction at hour {hour} (00:00-05:00) and user has low monthly average activity.",
-        )
+    # suspicious IP flag (from threat intel)
+    if suspicious_ip_flag and amt > 500:
+        add_rule("IP flagged by intel", "HIGH", "IP address is flagged as suspicious and amount is non-trivial.")
 
-    # 11) Cross-border card country mismatch
-    if card_country and txn_country and str(card_country).lower() != str(txn_country).lower():
-        add(
-            "Card country mismatch",
-            "MEDIUM",
-            f"Card registered in {card_country} but transaction declared in {txn_country}.",
-        )
+    # ATM distance large
+    if channel == "atm" and atm_distance_km and atm_distance_km > 300:
+        add_rule("ATM distance from last location", "HIGH", f"ATM is {atm_distance_km:.1f} km from last known location.")
 
-    # 12) Low anomaly but rules indicate risk — e.g., if ML says low but many rules fired
-    # (we'll compute a combined level below)
+    # card country mismatch cross-border
+    if card_country and declared_country and card_country != declared_country:
+        add_rule("Card country mismatch", "HIGH", f"Card country {card_country} != declared country {declared_country}.")
 
-    # compute aggregate highest severity
-    severity_order = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+    # -------- MEDIUM rules --------
+    # Spending spike vs monthly avg or 7d rolling avg
+    if monthly_avg > 0 and amt >= 5 * monthly_avg and amt > 1000:
+        add_rule("Large spike vs monthly avg", "HIGH",
+                 f"Amount {amt} >=5x monthly average {monthly_avg:.2f}.")
+    elif rolling_avg_7d > 0 and amt >= 3 * rolling_avg_7d and amt > 500:
+        add_rule("Spike vs 7-day average", "MEDIUM",
+                 f"Amount {amt} >=3x 7-day rolling avg {rolling_avg_7d:.2f}.")
+    elif monthly_avg > 0 and amt >= 2 * monthly_avg and amt > 500:
+        add_rule("Above monthly usual", "MEDIUM",
+                 f"Amount {amt} >=2x monthly average {monthly_avg:.2f}.")
+
+    # Moderate velocity
+    if txns_1h >= 5:
+        add_rule("Elevated velocity (1h)", "MEDIUM", f"{txns_1h} txns in last 1 hour.")
+    if txns_24h >= 10 and txns_24h < 50:
+        add_rule("Elevated velocity (24h)", "MEDIUM", f"{txns_24h} txns in last 24 hours.")
+
+    # Time-of-day anomalies for low-activity customers
+    if 0 <= hour <= 5 and monthly_avg < 2000 and amt > 100:
+        add_rule("Late-night transaction for low-activity customer", "MEDIUM",
+                 f"Transaction at hour {hour} for a low-activity customer; amount {amt}.")
+
+    # Device mismatch vs last seen
+    if last_device and curr_device and last_device != curr_device:
+        add_rule("Device mismatch from last seen", "MEDIUM",
+                 f"Device changed from '{last_device}' to '{curr_device}'.")
+
+    # billing vs shipping mismatch for online orders
+    if channel == "online" or channel == "online purchase":
+        if shipping_addr and billing_addr and shipping_addr.strip().lower() != billing_addr.strip().lower():
+            add_rule("Billing vs shipping address mismatch", "MEDIUM",
+                     "Billing address differs from shipping address for e-commerce transaction.")
+
+    # card fields missing when required
+    if channel in ("credit card", "online", "online purchase"):
+        if not cvv_provided:
+            add_rule("Missing CVV for card transaction", "MEDIUM", "CVV not provided for card e-commerce transaction.")
+
+    # new device but low amount (low risk but notable)
+    if device_new and amt < 200:
+        add_rule("New device (low amount)", "LOW", "Transaction from new device but low amount.")
+
+    # beneficiaries created but not high amount
+    if beneficiaries_added_24h > 0 and beneficiaries_added_24h < 3:
+        add_rule("Beneficiaries recently added", "LOW",
+                 f"{beneficiaries_added_24h} beneficiaries added in last 24h.")
+
+    # suspicious but not decisive IP info
+    if ip_country and ip_country in {"nigeria", "romania", "ukraine", "russia"}:
+        add_rule("IP from higher-risk country", "MEDIUM",
+                 f"IP country flagged as higher-risk: {ip_country} (contextual).")
+
+    # default highest severity
     highest = "LOW"
     for r in rules:
-        if severity_order[r["severity"]] > severity_order[highest]:
-            highest = r["severity"]
+        highest = escalate(highest, r["severity"])
 
     return rules, highest
 
-
-# ------------------------------
-# 4. Combine rule results with models
-# ------------------------------
-def combine_decision(ml_risk: str, rule_level: str) -> str:
+# ----------------------------
+# Combine ML + Rules into final decision
+# ----------------------------
+def combine_final_risk(ml_risk: str, rule_highest: str) -> str:
     """
-    Combine ML-derived risk and rule-derived risk into a final label.
-    Priority: if either is CRITICAL -> CRITICAL, else escalate if either is HIGH etc.
+    Combine ML risk and rule-derived highest severity.
+    Priority: CRITICAL > HIGH > MEDIUM > LOW
+    But allow rules to escalate ML and vice versa.
     """
-    order = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-    ml_idx = order.index(ml_risk)
-    rule_idx = order.index(rule_level)
-    final_idx = max(ml_idx, rule_idx)
-    return order[final_idx]
+    # escalate to the worst of the two
+    return escalate(ml_risk, rule_highest)
 
+# ----------------------------
+# ML scoring wrapper
+# ----------------------------
+def score_transaction_ml(model_pipeline, iforest_pipeline, model_payload: Dict) -> Tuple[float, float, str]:
+    # Prepare minimal df for the pipeline (adapt if pipeline expects more)
+    model_df = pd.DataFrame([{
+        "Amount": model_payload.get("Amount", 0.0),
+        "TransactionType": model_payload.get("TransactionType", "PAYMENT"),
+        "Location": model_payload.get("Location", "Unknown"),
+        "DeviceID": model_payload.get("DeviceID", "Unknown"),
+        "Channel": model_payload.get("Channel", "Other"),
+        "hour": model_payload.get("hour", 0),
+        "day_of_week": model_payload.get("day_of_week", 0),
+        "month": model_payload.get("month", 0),
+    }])
+    try:
+        fraud_prob = float(model_pipeline.predict_proba(model_df)[0, 1])
+    except Exception as e:
+        st.error("Supervised model scoring error - check pipeline input schema")
+        st.exception(e)
+        fraud_prob = 0.0
+    try:
+        raw = float(iforest_pipeline.decision_function(model_df)[0])
+        anomaly_score = -raw
+    except Exception as e:
+        st.error("IsolationForest scoring error - check pipeline input schema")
+        st.exception(e)
+        anomaly_score = 0.0
+    ml_label = ml_risk_label(fraud_prob, anomaly_score)
+    return fraud_prob, anomaly_score, ml_label
 
-# ------------------------------
-# 5. UI
-# ------------------------------
-st.set_page_config(
-    page_title="Real-Time Fraud Detection Prototype (Rules + ML)",
-    page_icon="💳",
-    layout="centered",
-)
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+st.set_page_config(page_title="Real-Time Fraud Detection (Rules + ML)", page_icon="💳", layout="centered")
+st.title("💳 Real-Time Fraud Detection — Rules + ML")
+st.write("Select channel and fill required fields. Optional historical fields enable velocity & behavioural rules.")
 
-st.title("💳 Real-Time Fraud Detection Prototype (Rules + ML)")
-st.write(
-    "This demo combines pre-trained ML models (LightGBM + IsolationForest) with explicit rule-based checks "
-    "for additional safety. Enter transaction details below."
-)
 st.markdown("---")
+st.sidebar.header("Configuration / Notes")
+st.sidebar.markdown("""
+- Provide historical/telemetry inputs when available (monthly avg, last device, last location coords, counts).
+- Velocity rules (1h / 24h / 7d) and behavioural anomalies (device churn, impossible travel) are supported.
+- Tune thresholds for your product and currency.
+""")
 
-# Sidebar info
-st.sidebar.header("⚙️ Configuration / Quick notes")
-st.sidebar.markdown(
-    """
-- Start by selecting the **Channel**. The UI will adapt to collect channel-specific fields.
-- Provide any available account history (monthly average, recent transaction count) to enable spending-pattern rules.
-- IP country / Declared country fields allow IP-location mismatch checks.
-"""
-)
+# Channel selector (single choice)
+channel = st.selectbox("Transaction Channel", ["Choose...", "Bank", "Mobile App", "ATM", "Credit Card", "POS", "Online Purchase", "NetBanking"])
 
-# Step 1: choose channel (this drives the rest of the form)
-st.header("Step 1 — Choose Channel")
-channel_choice = st.selectbox(
-    "Which channel is this transaction originating from?",
-    ["Bank", "Mobile App", "ATM", "Credit Card", "POS", "Online Purchase", "NetBanking", "Other"],
-)
+# Render channel-specific inputs only after selection
+if channel and channel != "Choose...":
+    st.markdown(f"### Inputs for channel: **{channel}**")
 
-st.markdown("---")
-st.header("Step 2 — Channel-specific Transaction Details")
-
-# We'll collect a common block + channel-specific fields
-with st.form("txn_form_v2"):
+    # Common fields
     col1, col2 = st.columns(2)
     with col1:
-        amount = st.number_input("Transaction Amount", min_value=0.0, value=1200.0, step=10.0)
-        txn_type = st.selectbox(
-            "Transaction Type",
-            ["PAYMENT", "TRANSFER", "DEBIT", "CREDIT", "CASH_OUT", "OTHER"],
-            index=0,
-        )
-        location = st.text_input("Location (City / Region)", value="Karachi")
-        declared_country = st.text_input("Declared Country (country for transaction)", value="Pakistan")
+        amount = st.number_input("Transaction amount", min_value=0.0, value=1200.0, step=10.0)
+        txn_type = st.selectbox("Transaction type", ["PAYMENT", "TRANSFER", "DEBIT", "CREDIT", "CASH_OUT", "OTHER"])
+        location = st.text_input("City / Region (declared location)", value="Karachi")
+        declared_country = st.text_input("Declared Country", value="Pakistan")
     with col2:
-        txn_date = st.date_input("Transaction Date", value=datetime.date.today())
-        txn_time = st.time_input("Transaction Time", value=datetime.datetime.now().time())
-        hour = txn_time.hour
+        txn_date = st.date_input("Transaction date", value=datetime.date.today())
+        txn_time = st.time_input("Transaction time", value=datetime.datetime.now().time())
         device = st.text_input("Device / OS", value="Android")
-        device_last_seen = st.text_input("Last known device (if any)", value="Android")
+        device_last_seen = st.text_input("Last known device (optional)", value="Android")
 
-    # Account history (helps spending-pattern rules)
-    st.markdown("**Account history (optional but recommended)**")
+    txn_dt = datetime.datetime.combine(txn_date, txn_time)
+    hour = txn_dt.hour
+    day_of_week = txn_dt.weekday()
+    month = txn_dt.month
+
+    # Telemetry & history (optional but recommended)
+    st.markdown("#### Optional account telemetry / recent activity (helps rules)")
     col3, col4 = st.columns(2)
     with col3:
         monthly_avg = st.number_input("Customer monthly average spend", min_value=0.0, value=10000.0, step=100.0)
-        transactions_last_24h = st.number_input("Transactions in last 24h", min_value=0, value=1, step=1)
+        rolling_avg_7d = st.number_input("7-day rolling average", min_value=0.0, value=3000.0, step=50.0)
+        txns_last_1h = st.number_input("Transactions in last 1 hour", min_value=0, value=0, step=1)
+        txns_last_24h = st.number_input("Transactions in last 24 hours", min_value=0, value=1, step=1)
     with col4:
+        txns_last_7d = st.number_input("Transactions in last 7 days", min_value=0, value=7, step=1)
+        beneficiaries_added_24h = st.number_input("Beneficiaries added in last 24h", min_value=0, value=0, step=1)
         failed_login_attempts = st.number_input("Failed login attempts (recent)", min_value=0, value=0, step=1)
-        new_beneficiary = st.checkbox("Is this to a newly added beneficiary?", value=False)
+        beneficiaries_added_24h = int(beneficiaries_added_24h)
 
-    # IP & geo
-    st.markdown("**IP & geo details**")
+    # IP / geo / coords
+    st.markdown("#### IP & Geo (optional but highly recommended)")
     col5, col6 = st.columns(2)
     with col5:
-        ip_address = st.text_input("Client IP address (optional)", value="")
+        client_ip = st.text_input("Client IP (optional)", value="")
         ip_country = st.text_input("IP-derived country (optional)", value="")
+        suspicious_ip_flag = st.checkbox("IP flagged by threat intel?", value=False)
     with col6:
-        atm_distance_km = st.number_input("ATM distance from last location (km) — if ATM use", min_value=0.0, value=0.0)
-        card_country = st.text_input("Card registered country (if card used)", value="")
+        # last known coords (from prior session) and current txn coords (if available)
+        last_known_lat = st.number_input("Last known latitude (optional)", format="%.6f", value=0.0)
+        last_known_lon = st.number_input("Last known longitude (optional)", format="%.6f", value=0.0)
+        txn_lat = st.number_input("Transaction latitude (optional)", format="%.6f", value=0.0)
+        txn_lon = st.number_input("Transaction longitude (optional)", format="%.6f", value=0.0)
 
-    # Channel specific fields
-    st.markdown(f"**Fields for channel: {channel_choice}**")
-    channel = channel_choice.lower()
-    card_used_online = False
+    # Channel-specific fields (only visible when that channel chosen)
+    card_masked = ""
+    card_country = ""
     cvv_provided = True
-    if channel_choice == "Credit Card":
-        col7, col8 = st.columns(2)
-        with col7:
-            card_masked = st.text_input("Card number (masked) — e.g. 4111****1111", value="")
-            card_bin = st.text_input("Card BIN (first 6 digits) (optional)", value="")
-            card_holder_name = st.text_input("Cardholder name", value="")
-        with col8:
-            card_country = st.text_input("Card country (if different)", value=card_country or "")
-            cvv_provided = st.checkbox("CVV entered/verified", value=True)
-            ecom = st.checkbox("Card used for e-commerce / online", value=False)
-            card_used_online = ecom
-    elif channel_choice == "Online Purchase":
+    atm_distance_km = 0.0
+    shipping_address = ""
+    billing_address = ""
+    new_beneficiary = False
+    beneficiaries_added_24h = int(beneficiaries_added_24h)
+    card_used_online = False
+
+    if channel == "Credit Card":
+        st.markdown("**Credit Card details**")
+        card_masked = st.text_input("Card number (masked, e.g. 4111****1111)", value="")
+        card_country = st.text_input("Card issuing country (optional)", value="")
+        cvv_provided = st.checkbox("CVV provided/verified?", value=True)
+        card_used_online = st.checkbox("Card used for e-commerce?", value=False)
+
+    elif channel == "Online Purchase":
+        st.markdown("**Online purchase details**")
         merchant = st.text_input("Merchant name / ID", value="")
-        browser = st.text_input("Browser / UA string (short)", value="")
-        ip_address = st.text_input("Client IP address (optional)", value=ip_address or "")
-        ip_country = st.text_input("IP-derived country (optional)", value=ip_country or "")
-        # card details if card used online
-        used_card_online = st.checkbox("Payment by card", value=False)
-        if used_card_online:
-            card_used_online = True
-            cvv_provided = st.checkbox("CVV entered/verified", value=True)
-            card_country = st.text_input("Card country (if different)", value=card_country or "")
-    elif channel_choice == "Mobile App":
+        shipping_address = st.text_input("Shipping address", value="")
+        billing_address = st.text_input("Billing address", value=shipping_address)
+        card_used_online = st.checkbox("Payment by card?", value=False)
+        if card_used_online:
+            cvv_provided = st.checkbox("CVV provided/verified?", value=True)
+            card_masked = st.text_input("Card masked", value="")
+
+    elif channel == "ATM":
+        st.markdown("**ATM details**")
+        atm_id = st.text_input("ATM ID / Terminal", value="")
+        atm_distance_km = st.number_input("ATM distance from last known location (km)", min_value=0.0, value=0.0, step=1.0)
+
+    elif channel == "Mobile App":
+        st.markdown("**Mobile app details**")
         app_version = st.text_input("App version", value="1.0.0")
-        device_fingerprint = st.text_input("Device fingerprint (optional)", value="")
-        failed_login_attempts = st.number_input("Failed login attempts (recent)", min_value=0, value=failed_login_attempts, step=1)
-    elif channel_choice == "ATM":
-        atm_id = st.text_input("ATM ID", value="")
-        atm_location = st.text_input("ATM location city/region", value=location)
-        atm_distance_km = st.number_input("ATM distance (km) from last known location", min_value=0.0, value=atm_distance_km)
-    elif channel_choice == "POS":
-        merchant_id = st.text_input("POS Merchant ID", value="")
-        pos_location = st.text_input("POS location", value=location)
-    elif channel_choice == "NetBanking" or channel_choice == "Bank":
+        device_fingerprint = st.text_input("Device fingerprint ID (optional)", value="")
+
+    elif channel == "POS":
+        st.markdown("**POS details**")
+        pos_merchant_id = st.text_input("POS Merchant ID", value="")
+        store_name = st.text_input("Store name", value="")
+
+    elif channel == "Bank" or channel == "NetBanking":
+        st.markdown("**Bank / NetBanking details**")
         beneficiary = st.text_input("Beneficiary (if transfer)", value="")
-        new_beneficiary = st.checkbox("Is beneficiary newly added?", value=new_beneficiary)
-    else:
-        extra_notes = st.text_area("Any extra notes / context", value="")
+        new_beneficiary = st.checkbox("Is this a newly added beneficiary?", value=False)
 
-    submitted = st.form_submit_button("🚀 Run Fraud Check")
+    # submit
+    submit = st.button("🚀 Run Fraud Check")
 
-# When submitted, create payload, call ML scoring and rules engine
-if submitted:
-    txn_datetime = datetime.datetime.combine(txn_date, txn_time)
-    hour = txn_datetime.hour
-    day_of_week = txn_datetime.weekday()
-    month = txn_datetime.month
+    # When clicked: build payload, run ML scoring, run rules, combine
+    if submit:
+        # Prepare payload for rules & ML
+        payload = {
+            "Amount": amount,
+            "TransactionType": txn_type,
+            "Location": location,
+            "DeviceID": device,
+            "device_last_seen": device_last_seen,
+            "Channel": channel,
+            "hour": hour,
+            "day_of_week": day_of_week,
+            "month": month,
+            # historical telemetry
+            "monthly_avg": monthly_avg,
+            "rolling_avg_7d": rolling_avg_7d,
+            "txns_last_1h": int(txns_last_1h),
+            "txns_last_24h": int(txns_last_24h),
+            "txns_last_7d": int(txns_last_7d),
+            "beneficiaries_added_24h": beneficiaries_added_24h,
+            "failed_login_attempts": failed_login_attempts,
+            "beneficiaries_added_24h": beneficiaries_added_24h,
+            # ip / geo
+            "client_ip": client_ip,
+            "ip_country": ip_country,
+            "declared_country": declared_country,
+            "suspicious_ip_flag": suspicious_ip_flag,
+            "last_known_lat": last_known_lat if last_known_lat != 0.0 else None,
+            "last_known_lon": last_known_lon if last_known_lon != 0.0 else None,
+            "txn_lat": txn_lat if txn_lat != 0.0 else None,
+            "txn_lon": txn_lon if txn_lon != 0.0 else None,
+            # channel specifics
+            "card_masked": card_masked,
+            "card_country": card_country,
+            "cvv_provided": cvv_provided,
+            "atm_distance_km": atm_distance_km,
+            "shipping_address": shipping_address,
+            "billing_address": billing_address,
+            "new_beneficiary": new_beneficiary,
+            "beneficiaries_added_24h": beneficiaries_added_24h,
+            "suspicious_ip_flag": suspicious_ip_flag,
+            "DeviceID": device,
+            "device_last_seen": device_last_seen,
+            "card_used_online": card_used_online,
+        }
 
-    # Build payload for model: keep the original model field names
-    input_payload = {
-        "Amount": amount,
-        "TransactionType": txn_type,
-        "Location": location,
-        "DeviceID": device,
-        "Channel": channel_choice,
-        "hour": hour,
-        "day_of_week": day_of_week,
-        "month": month,
-        # extra fields for rules
-        "ip_address": ip_address,
-        "ip_country": ip_country,
-        "declared_country": declared_country,
-        "monthly_avg": monthly_avg,
-        "transactions_last_24h": transactions_last_24h,
-        "failed_login_attempts": failed_login_attempts,
-        "new_beneficiary": new_beneficiary,
-        "atm_distance_km": atm_distance_km,
-        "cvv_provided": cvv_provided,
-        "card_country": card_country,
-        "device_last_seen": device_last_seen,
-        "card_used_online": card_used_online,
-    }
+        # Score ML
+        with st.spinner("Scoring with ML models..."):
+            fraud_prob, anomaly_score, ml_label = score_transaction_ml(supervised_pipeline, iforest_pipeline, payload)
 
-    # Score with ML models
-    with st.spinner("Scoring transaction with ML models..."):
-        df_for_model = pd.DataFrame([{
-            # The supervised pipeline expects these fields — adapt if your pipeline expects others
-            "Amount": input_payload["Amount"],
-            "TransactionType": input_payload["TransactionType"],
-            "Location": input_payload["Location"],
-            "DeviceID": input_payload["DeviceID"],
-            "Channel": input_payload["Channel"],
-            "hour": input_payload["hour"],
-            "day_of_week": input_payload["day_of_week"],
-            "month": input_payload["month"],
-        }])
-        # If your pipeline expects more fields, extend the dict accordingly.
-        try:
-            fraud_prob = float(supervised_pipeline.predict_proba(df_for_model)[0, 1])
-        except Exception as e:
-            st.error("Error scoring with supervised model. Check model input format.")
-            st.exception(e)
-            fraud_prob = 0.0
-        try:
-            raw_score = float(iforest_pipeline.decision_function(df_for_model)[0])
-            anomaly_score = -raw_score
-        except Exception as e:
-            st.error("Error scoring with IsolationForest. Check model input format.")
-            st.exception(e)
-            anomaly_score = 0.0
+        # Evaluate rules (velocity + behavioural anomalies included)
+        rules_triggered, rules_highest = evaluate_rules(payload)
 
-    ml_risk = risk_from_scores(fraud_prob, anomaly_score)
+        # Combine final risk
+        final_risk = combine_final_risk(ml_label, rules_highest)
 
-    # Evaluate rules
-    rules_triggered, rules_level = evaluate_rules(input_payload, fraud_prob, anomaly_score)
+        # Present results
+        st.markdown("## 🔎 Results")
+        # nice badge
+        color_map = {"LOW": "#2e7d32", "MEDIUM": "#f9a825", "HIGH": "#f57c00", "CRITICAL": "#c62828"}
+        badge_color = color_map.get(final_risk, "#607d8b")
+        st.markdown(
+            f"""<div style="padding:0.75rem 1rem;border-radius:0.5rem;background-color:{badge_color}22;border:1px solid {badge_color};">
+                <strong style="color:{badge_color};font-size:1.1rem;">Final Risk Level: {final_risk}</strong>
+            </div>""",
+            unsafe_allow_html=True,
+        )
 
-    # Combine into final decision
-    final_risk = combine_decision(ml_risk, rules_level)
+        colA, colB = st.columns(2)
+        with colA:
+            st.metric("Fraud Probability (supervised)", f"{fraud_prob:.8f}")
+            st.metric("ML Risk Label", ml_label)
+        with colB:
+            st.metric("Anomaly Score (IsolationForest)", f"{anomaly_score:.5f}")
+            st.metric("Rules-derived highest severity", rules_highest)
 
-    # Show results
-    st.markdown("## 🔎 Results")
-    # risk badge
-    color_map = {
-        "LOW": "#2e7d32",
-        "MEDIUM": "#f9a825",
-        "HIGH": "#f57c00",
-        "CRITICAL": "#c62828",
-    }
-    risk_color = color_map.get(final_risk, "#607d8b")
-    st.markdown(
-        f"""
-        <div style="padding: 0.75rem 1rem; border-radius: 0.5rem;
-                    background-color: {risk_color}22; border: 1px solid {risk_color};">
-            <span style="font-size: 1.1rem; font-weight: 600; color: {risk_color};">
-                Final Risk Level: {final_risk}
-            </span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        st.markdown("### ⚠ Triggered Rules")
+        if rules_triggered:
+            for r in rules_triggered:
+                sev = r["severity"]
+                emoji = "🔴" if sev in ("HIGH", "CRITICAL") else "🟠" if sev == "MEDIUM" else "🟢"
+                st.write(f"{emoji} **{r['name']}** — *{r['severity']}*")
+                st.caption(r["detail"])
+        else:
+            st.success("No deterministic rules triggered.")
 
-    # ML metrics
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.metric("Fraud Probability (LightGBM)", f"{fraud_prob:.8f}")
-    with col_b:
-        st.metric("Anomaly Score (IsolationForest, higher=more anomalous)", f"{anomaly_score:.5f}")
+        # Diagnostic payload for debugging
+        st.markdown("### 📦 Payload (debug)")
+        st.json(payload)
 
-    # Show triggered rules, if any
-    st.markdown("### ⚠️ Rule-based checks triggered")
-    if rules_triggered:
-        for r in rules_triggered:
-            sev = r["severity"]
-            icon = "🔴" if sev in ("HIGH", "CRITICAL") else "🟠" if sev == "MEDIUM" else "🟢"
-            st.write(f"{icon} **{r['name']}** — *{sev}*")
-            st.caption(r["detail"])
-    else:
-        st.info("No explicit rules were triggered.")
+        st.markdown(
+            """
+            ### Notes & tuning
+            - Velocity thresholds (1h / 24h / 7d) and absolute amount thresholds are examples — tune for your product.
+            - Provide real telemetry (last coords, last device, txns counts) for accurate behavioural checks.
+            - Consider logging triggered rules + ML outputs to a datastore for periodic threshold tuning and model retraining.
+            """
+        )
 
-    # Show ML-only risk and rule-level separately for transparency
-    st.markdown("### 🧾 Diagnostic summary")
-    st.write(f"- ML-derived risk: **{ml_risk}**")
-    st.write(f"- Rule-derived highest severity: **{rules_level}**")
-    st.write(f"- Final combined risk: **{final_risk}**")
-
-    st.markdown("### 📦 Input payload (for debugging)")
-    st.json(input_payload)
-
-    st.markdown(
-        """
-        ### 🧠 Notes on interpretation
-        - Rule checks are deterministic heuristics (IP vs declared country mismatch, velocity, ATM distance, CVV missing, etc.).
-        - ML models provide probabilistic/anomaly signals. Final risk escalates if either ML or rule checks are high.
-        - Tune thresholds (amount multipliers, suspicious countries, distance km) for your product and region.
-        """
-    )
 else:
-    st.info("Choose a channel and fill the form above, then click **Run Fraud Check**.")
+    st.info("Choose a transaction channel to show channel-specific fields.")
+
