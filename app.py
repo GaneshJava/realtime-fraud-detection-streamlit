@@ -4,7 +4,7 @@
 # - Clear Transaction Type field definitions for TRANSFER / PAYMENT / BILL_PAY
 # - ATM channel removes client IP / derived IP / device fields
 # - Duplicate IP fields removed (single client_ip / ip_country usage where applicable)
-# - Consistent location fields for ALL transaction types: home_city, home_country, txn_location_ip, txn_city, txn_country
+# - Consistent location fields for ALL transaction types: home_city, home_country, txn_location_ip, txn_city, txn_country 
 
 import datetime
 from math import radians, sin, cos, asin, sqrt
