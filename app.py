@@ -1460,38 +1460,4 @@ if channel and channel != "Choose...":
         st.markdown("### 📦 Payload (debug)")
         st.json(payload)
 
-        # Examples section (per channel)
-        with st.expander("📚 Example good & fraud transactions for this channel"):
-            ch_df = EXAMPLE_TXNS_DF[EXAMPLE_TXNS_DF["channel"] == channel_lower]
-            good_df = ch_df[ch_df["example_type"] == "GOOD"]
-            fraud_df = ch_df[ch_df["example_type"] == "FRAUD"]
-
-            st.markdown("**Good / genuine transactions (examples)**")
-            st.dataframe(
-                good_df[
-                    [
-                        "transaction_type",
-                        "amount_in_inr",
-                        "fraud_confidence_ml_pct",
-                        "anomaly_score_ml_pct",
-                        "final_risk",
-                    ]
-                ]
-            )
-            st.markdown("**Fraud / suspicious transactions (examples)**")
-            st.dataframe(
-                fraud_df[
-                    [
-                        "transaction_type",
-                        "amount_in_inr",
-                        "fraud_confidence_ml_pct",
-                        "anomaly_score_ml_pct",
-                        "final_risk",
-                    ]
-                ]
-            )
-
-else:
-    st.info(
-        "Select currency, enter amount/date/time, then pick a channel to show channel-specific inputs."
-    )
+       
