@@ -1317,10 +1317,7 @@ if channel and channel != "Choose...":
             key=f"client_ip_{channel_lower}",
             help="IP address as seen by the front-end channel.",
         )
-        ip_country = st.text_input(
-            "IP-derived country (optional)",
-            key=f"ip_country_{channel_lower}",
-            help="Country inferred from client IP geolocation.",
+       
         )
         suspicious_ip_flag = st.checkbox(
             "IP flagged by threat intel?",
