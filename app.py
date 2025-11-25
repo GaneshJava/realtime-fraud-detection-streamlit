@@ -43,12 +43,12 @@ BASE_THRESHOLDS_INR = {
 
 # Thresholds used by ML-risk labelling
 FRAUD_MED = 0.00005
-FRAUD_HIGH = 0.00043328
+FRAUD_HIGH = 0.00023328
 FRAUD_CRIT = 0.01732857
 
-ANOM_MED = 40
-ANOM_HIGH = 60
-ANOM_CRIT = 70
+ANOM_MED = 0.04
+ANOM_HIGH = 0.05
+ANOM_CRIT = 0.08
 
 SEVERITY_ORDER = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
@@ -1387,8 +1387,8 @@ if channel and channel != "Choose...":
         )
 
         # Normalize for interpretability (0–100)
-        fraud_score = normalize_score(fraud_prob_raw, min_val=0.0, max_val=20)
-        anomaly_score = normalize_score(anomaly_raw, min_val=0.0, max_val=100)
+        fraud_score = normalize_score(fraud_prob_raw, min_val=0.0, max_val=0.02)
+        anomaly_score = normalize_score(anomaly_raw, min_val=0.0, max_val=0.10)
 
         rules_triggered, rules_highest = evaluate_rules(payload, currency)
 
