@@ -11,6 +11,7 @@
 # - Beneficiary type as mutually exclusive options
 # - Additional channels: Debit Card, Other
 
+
 import datetime
 import time  # used for response-time measurement
 from math import radians, sin, cos, asin, sqrt
@@ -65,6 +66,7 @@ CHANNEL_TXN_TYPES = {
     "online purchase": ["PAYMENT"],
     "bank": ["DEPOSIT", "TRANSFER", "WITHDRAWAL"],
     "netbanking": ["TRANSFER", "BILL_PAY", "PAYMENT"],
+    "upi": ["PAYMENT", "TRANSFER"],
     "other": ["PAYMENT", "TRANSFER", "BILL_PAY", "OTHER"],
 }
 
@@ -78,51 +80,11 @@ CHANNEL_DISPLAY_TO_CANONICAL = {
     "POS": "POS",
     "Online Purchase": "Online Purchase",
     "NetBanking": "NetBanking",
+    "UPI": "UPI",
     "Other": "Other",
 }
 
-# -------------------------
-# Example transactions (for KT; static)
-# -------------------------
-def build_example_transactions() -> pd.DataFrame:
-    """
-    Build a small synthetic table of example transactions per channel.
-    These are illustrative only – not from the real model.
-    """
-    rows = []
-    for channel_key, txn_types in CHANNEL_TXN_TYPES.items():
-        # use canonical channel key as identifier in examples
-        for i in range(5):
-            rows.append(
-                {
-                    "channel": channel_key,
-                    "example_type": "GOOD",
-                    "transaction_type": txn_types[i % len(txn_types)],
-                    "amount_in_inr": 5_000 + i * 2_000,
-                    "fraud_confidence_ml_pct": 0.5 + i * 0.3,  # illustrative only
-                    "anomaly_score_ml_pct": 0.2 + i * 0.2,
-                    "rules_risk": "LOW",
-                    "final_risk": "LOW",
-                }
-            )
-        for i in range(5):
-            rows.append(
-                {
-                    "channel": channel_key,
-                    "example_type": "FRAUD",
-                    "transaction_type": txn_types[i % len(txn_types)],
-                    "amount_in_inr": 200_000 + i * 500_000,
-                    "fraud_confidence_ml_pct": 60 + i * 8,
-                    "anomaly_score_ml_pct": 40 + i * 5,
-                    "rules_risk": "HIGH" if i < 3 else "CRITICAL",
-                    "final_risk": "HIGH" if i < 3 else "CRITICAL",
-                }
-            )
-    df = pd.DataFrame(rows)
-    return df
 
-
-EXAMPLE_TXNS_DF = build_example_transactions()
 
 # -------------------------
 # HELPERS
@@ -351,6 +313,23 @@ def evaluate_rules(payload: Dict, currency: str) -> Tuple[List[Dict], str]:
     cloud_host_ip = bool(payload.get("cloud_host_ip", False))
     ip_risk_score = int(payload.get("ip_risk_score", 0) or 0)
 
+    # UPI-specific rules
+    if channel == "upi":
+        if amt >= MED_AMT and new_benef:
+            add_rule(
+                "UPI payment to newly added payee",
+                "HIGH",
+                "UPI transfer to an untrusted/new VPA with significant amount."
+            )
+
+        if txns_1h >= 5:
+            add_rule(
+                "UPI rapid transactions",
+                "MEDIUM",
+                f"{txns_1h} UPI transactions within 1 hour."
+            )
+
+
     def add_rule(name: str, sev: str, detail: str):
         rules.append({"name": name, "severity": sev, "detail": detail})
 
@@ -543,6 +522,8 @@ def evaluate_rules(payload: Dict, currency: str) -> Tuple[List[Dict], str]:
                 "Transfer missing source or destination account details.",
             )
 
+
+
     # 23) Onsite branch transactions without identity
     if channel == "bank":
         if not id_type or not id_number:
@@ -572,6 +553,7 @@ def evaluate_rules(payload: Dict, currency: str) -> Tuple[List[Dict], str]:
             "MEDIUM",
             "IP appears to belong to a cloud hosting provider, not a residential ISP.",
         )
+
     if ip_risk_score >= 80:
         add_rule(
             "High IP reputation risk score",
@@ -591,6 +573,7 @@ def evaluate_rules(payload: Dict, currency: str) -> Tuple[List[Dict], str]:
         highest = escalate(highest, r["severity"])
 
     return rules, highest
+
 
 # -------------------------
 # Combine final risk
@@ -1062,6 +1045,33 @@ if channel_display and channel_display != "Choose...":
                 "device_last_seen": last_device,
             }
         )
+    # -------------------
+# UPI CHANNEL FIELDS
+# -------------------
+    upi_fields = {}
+    if channel_lower == "upi":
+        st.subheader("UPI Fields")
+        upi_id = st.text_input(
+            "UPI ID (e.g., username@bank)",
+            key="upi_id",
+            help="The sender’s UPI virtual payment address."
+        )
+        merchant_upi = st.text_input(
+            "Merchant / Recipient UPI ID",
+            key="upi_merchant",
+            help="The recipient’s UPI virtual address."
+        )
+        device_upi = st.text_input(
+            "Device / App (optional)",
+            key="upi_device",
+            help="App/device used for UPI payment, e.g. GPay / PhonePe."
+        )    
+
+        upi_fields.update({
+            "upi_id": upi_id,
+            "merchant_upi": merchant_upi,
+            "DeviceID": device_upi,
+        })
 
     # Credit Card
     cc_fields: Dict = {}
@@ -1634,6 +1644,8 @@ if channel_display and channel_display != "Choose...":
             payload.update(online_fields)
         elif channel_lower == "netbanking":
             payload.update(netbanking_fields)
+        elif channel_lower == "upi":
+            payload.update(upi_fields)
         elif channel_lower == "other":
             payload.update(other_fields)
 
@@ -1721,39 +1733,25 @@ if channel_display and channel_display != "Choose...":
         st.markdown("### 📦 Payload (debug)")
         st.json(payload)
 
-        # Examples section for KT
-        with st.expander("📚 Example good & fraud transactions for this channel"):
-            ch_key = channel_lower
-            ch_df = EXAMPLE_TXNS_DF[EXAMPLE_TXNS_DF["channel"] == ch_key]
-            good_df = ch_df[ch_df["example_type"] == "GOOD"]
-            fraud_df = ch_df[ch_df["example_type"] == "FRAUD"]
-
-            st.markdown("**Good / genuine transactions (examples)**")
-            st.dataframe(
-                good_df[
-                    [
-                        "transaction_type",
-                        "amount_in_inr",
-                        "fraud_confidence_ml_pct",
-                        "anomaly_score_ml_pct",
-                        "final_risk",
-                    ]
-                ]
-            )
-            st.markdown("**Fraud / suspicious transactions (examples)**")
-            st.dataframe(
-                fraud_df[
-                    [
-                        "transaction_type",
-                        "amount_in_inr",
-                        "fraud_confidence_ml_pct",
-                        "anomaly_score_ml_pct",
-                        "final_risk",
-                    ]
-                ]
-            )
+        
 
 else:
     st.info(
         "Select currency, enter amount/date/time, then pick a channel to show channel-specific inputs."
     )
+st.markdown(
+    """
+    <style>
+        /* Make entire app scrollable properly on Mac */
+        .main, .block-container {
+            overflow-y: auto !important;
+            max-height: 100vh !important;
+        }
+        /* Prevent inputs from growing out of screen */
+        .stTextInput, .stSelectbox, .stNumberInput {
+            overflow: visible !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
