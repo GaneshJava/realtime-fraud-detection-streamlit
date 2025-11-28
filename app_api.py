@@ -1,48 +1,3 @@
-Conversation opened. 13 messages. All messages read.
-
-Skip to content
-Using Gmail with screen readers
-app_api-py 
-2 of 4
-Source code
-Inbox
-
-Anas Awan
-Attachments
-Thu, Nov 20, 7:13 PM (8 days ago)
- 
-7
-
-Anas Awan
-Sun, Nov 23, 2:46 AM (5 days ago)
-I acknowledge. I will share the updated codes on Monday, will connect with you too.
-
-Anas Awan
-Attachments
-Mon, Nov 24, 12:38 AM (4 days ago)
-to me
-
-Here are the updated files with all the concerns addressed.
- 5 Attachments
-  •  Scanned by Gmail
-
-B N S Ganesh Prasad
-Mon, Nov 24, 1:10 PM (4 days ago)
-Hi Anas, Thanks for your support.. Please let me know when we can connect today on next steps. I propose 4 PM - 6 PM, anytime in between. Also, do let me know y
-
-Anas Awan
-Mon, Nov 24, 2:48 PM (4 days ago)
-Yes, I will be available at that time. Just send me the mail and I will be there
-
-B N S Ganesh Prasad <ganesh.java7@gmail.com>
-Mon, Nov 24, 4:14 PM (4 days ago)
-to Anas
-
-sent a meeting invite for 4:30 PM, 
-Here is the link for your reference: https://calendar.app.google/668rYLzPm5yBCnh79 
-
-Thanks & Regards
-Ganesh
 # app_api.py
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -146,5 +101,3 @@ def predict(payload: TransactionPayload) -> Dict[str, Any]:
         },
         "FinalRisk": final_risk,
     }
-app_api.py
-Displaying app_api.py.
